@@ -1,0 +1,1183 @@
+#!/usr/bin/env python3
+"""
+RAMDoc - Monitor de desempenho e otimizador de memoria
+A comprehensive tool for monitoring and optimizing system performance
+"""
+
+import os
+import re
+import sys
+import stat
+import time
+import shutil
+import argparse
+import threading
+import subprocess
+from collections import deque
+from datetime import datetime
+
+try:
+    import psutil
+except ImportError:
+    sys.stderr.write("Error: psutil module not found!\n")
+    sys.stderr.write("Install it with: pip3 install psutil\n")
+    sys.exit(1)
+
+
+def _color_supported():
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+COLORS_ON = _color_supported()
+
+
+def _c(code):
+    return code if COLORS_ON else ""
+
+
+class Colors:
+    RED = _c("\033[91m")
+    GREEN = _c("\033[92m")
+    YELLOW = _c("\033[93m")
+    BLUE = _c("\033[94m")
+    PURPLE = _c("\033[95m")
+    CYAN = _c("\033[96m")
+    WHITE = _c("\033[97m")
+    DIM = _c("\033[2m")
+    BOLD = _c("\033[1m")
+    RESET = _c("\033[0m")
+
+    ALT_SCREEN_ON = "\033[?1049h" if COLORS_ON else ""
+    ALT_SCREEN_OFF = "\033[?1049l" if COLORS_ON else ""
+    CURSOR_HIDE = "\033[?25l" if COLORS_ON else ""
+    CURSOR_SHOW = "\033[?25h" if COLORS_ON else ""
+    CLEAR = "\033[H\033[2J" if COLORS_ON else ""
+
+
+def human_size(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0 or unit == "TB":
+            if unit == "B":
+                return f"{int(n)} B"
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+ANSI_ESCAPE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def visible_len(text):
+    return len(ANSI_ESCAPE.sub("", text))
+
+
+def pad_visible(text, width):
+    pad = width - visible_len(text)
+    if pad > 0:
+        return text + " " * pad
+    return text
+
+
+def box_line(content, width):
+    return "│ " + pad_visible(content, width - 3) + " │"
+
+
+def color_for_percent(percent):
+    if percent < 50:
+        return Colors.GREEN
+    if percent < 80:
+        return Colors.YELLOW
+    return Colors.RED
+
+
+def render_bar(percent, width=28):
+    percent = max(0.0, min(100.0, float(percent)))
+    filled = percent / 100.0 * width
+    full = int(filled)
+    frac = filled - full
+    partial_chars = " ▏▎▍▌▋▊▉"
+    bar = "█" * full
+    if full < width:
+        idx = int(frac * (len(partial_chars) - 1) + 0.5)
+        bar += partial_chars[idx]
+        bar += "░" * (width - full - 1)
+    return f"{color_for_percent(percent)}{bar}{Colors.RESET}"
+
+
+def sparkline(values, max_width=60):
+    if not values:
+        return ""
+    vals = list(values)[-max_width:]
+    blocks = "▁▂▃▄▅▆▇█"
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1.0
+    out = []
+    for v in vals:
+        idx = int((v - lo) / span * (len(blocks) - 1) + 0.5)
+        out.append(blocks[max(0, min(len(blocks) - 1, idx))])
+    return "".join(out)
+
+
+def positive_int(value):
+    n = int(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return n
+
+
+def positive_float(value):
+    n = float(value)
+    if n <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return n
+
+
+def read_memory_psi():
+    try:
+        with open("/proc/pressure/memory") as f:
+            line = f.readline()
+        parts = dict(p.split("=") for p in line.split()[1:])
+        return float(parts.get("avg10", 0.0))
+    except (OSError, ValueError):
+        return None
+
+
+def collect_open_files():
+    open_paths = set()
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return open_paths
+    for pid in pids:
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if target.startswith("/"):
+                open_paths.add(os.path.realpath(target))
+    return open_paths
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_SVG = os.path.join(SCRIPT_DIR, "ramdoc.svg")
+
+
+def notify(summary, body):
+    """Send a desktop notification via notify-send (best-effort)."""
+    if not shutil.which("notify-send"):
+        return False
+    cmd = ["notify-send", "--app-name=RAMDoc"]
+    if os.path.isfile(ICON_SVG):
+        cmd += ["--icon", ICON_SVG]
+    cmd += [str(summary), str(body)]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=5)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def make_tray_icon(percent, size=64):
+    """Render a tray icon (equalizer bars) colored by RAM usage."""
+    from PIL import Image, ImageDraw
+
+    s = size * 4
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    margin = s * 0.03
+    d.rounded_rectangle(
+        [margin, margin, s - margin, s - margin],
+        radius=s * 0.22,
+        fill=(30, 32, 42, 255),
+        outline=(46, 49, 66, 255),
+        width=max(1, int(s * 0.02)),
+    )
+
+    percent = max(0.0, min(100.0, float(percent)))
+    if percent < 50:
+        color = (74, 222, 128, 255)
+    elif percent < 80:
+        color = (250, 204, 21, 255)
+    else:
+        color = (248, 113, 113, 255)
+
+    bar_w = s * 0.12
+    xs = [s * 0.21, s * 0.44, s * 0.67]
+    bases = (0.26, 0.44, 0.32)
+    growth = (0.44, 0.36, 0.40)
+    bottom = s * 0.78
+    for x, base, g in zip(xs, bases, growth):
+        h = (base + g * percent / 100.0) * s
+        top = bottom - h
+        d.rounded_rectangle(
+            [x, top, x + bar_w, bottom],
+            radius=bar_w / 2,
+            fill=color,
+        )
+
+    return img.resize((size, size), Image.LANCZOS)
+
+
+class RamDoc:
+    def __init__(self):
+        self.watch_history = deque(maxlen=180)
+        self.watch_log = deque(maxlen=8)
+
+    def print_banner(self):
+        banner = f"""
+{Colors.CYAN}{Colors.BOLD}
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║    ██████╗   █████╗   ██████╗   ██████╗    ██████╗    ██████╗                ║
+║    ██╔══██╗ ██╔══██╗ ██╔═══██╗ ██╔══██╗ ██╔════╝  ██╔════╝                ║
+║    ██████╔╝ ███████║ ██║   ██║ ██║  ██║ ██║  ███╗ ██║  ███╗               ║
+║    ██╔══██╗ ██╔══██║ ██║   ██║ ██║  ██║ ██║   ██║ ██║   ██║               ║
+║    ██║  ██║ ██║  ██║ ╚██████╔╝ ╚██████╔╝ ╚██████╔╝ ╚██████╔╝              ║
+║    ╚═╝  ╚═╝ ╚═╝  ╚═╝  ╚═════╝   ╚═════╝   ╚═════╝   ╚═════╝               ║
+║                                                                              ║
+║          Monitor de Desempenho & Otimizador de Memória                      ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+{Colors.RESET}
+                  {Colors.WHITE}por {Colors.PURPLE}Victor Queiroga{Colors.WHITE} · baseado em MEM-CLEAN de WickedSyntax{Colors.RESET}
+
+"""
+        print(banner)
+
+    def get_system_info(self):
+        """Get comprehensive system information"""
+        memory = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+        cpu_percent = psutil.cpu_percent(interval=0.4)
+        disk = psutil.disk_usage("/")
+        try:
+            load1, load5, load15 = os.getloadavg()
+        except OSError:
+            load1 = load5 = load15 = 0.0
+        return {
+            "memory": {
+                "percent": memory.percent,
+                "total": memory.total,
+                "used": memory.used,
+                "available": memory.available,
+            },
+            "swap": {
+                "percent": swap.percent,
+                "total": swap.total,
+                "used": swap.used,
+            },
+            "cpu": {
+                "percent": cpu_percent,
+                "count": psutil.cpu_count(),
+                "load": (load1, load5, load15),
+            },
+            "disk": {
+                "percent": disk.percent,
+                "total": disk.total,
+                "used": disk.used,
+                "free": disk.free,
+            },
+            "psi": read_memory_psi(),
+            "uptime": time.time() - psutil.boot_time(),
+        }
+
+    @staticmethod
+    def format_uptime(seconds):
+        seconds = int(seconds)
+        days, seconds = divmod(seconds, 86400)
+        hours, seconds = divmod(seconds, 3600)
+        minutes, seconds = divmod(seconds, 60)
+        if days:
+            return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def display_system_status(self):
+        """Display current system status"""
+        info = self.get_system_info()
+        mem = info["memory"]
+        swap = info["swap"]
+        cpu = info["cpu"]
+        disk = info["disk"]
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{Colors.BOLD}═══════════════════ SYSTEM STATUS ═══════════════════{Colors.RESET}")
+        print(f"{Colors.DIM}{now}  ·  uptime {self.format_uptime(info['uptime'])}{Colors.RESET}\n")
+
+        print(f"🧠 {Colors.BOLD}MEMORY{Colors.RESET}")
+        print(f"   RAM   {render_bar(mem['percent'])} {color_for_percent(mem['percent'])}"
+              f"{mem['percent']:5.1f}%{Colors.RESET}  "
+              f"{human_size(mem['used'])} / {human_size(mem['total'])}  "
+              f"({Colors.GREEN}avail {human_size(mem['available'])}{Colors.RESET})")
+        swap_color = Colors.GREEN if swap["total"] == 0 else color_for_percent(swap["percent"])
+        if swap["total"] > 0:
+            print(f"   SWAP  {render_bar(swap['percent'])} {swap_color}"
+                  f"{swap['percent']:5.1f}%{Colors.RESET}  "
+                  f"{human_size(swap['used'])} / {human_size(swap['total'])}")
+        else:
+            print(f"   SWAP  {Colors.DIM}not configured{Colors.RESET}")
+        if info["psi"] is not None:
+            psi = info["psi"]
+            psi_color = Colors.GREEN if psi < 10 else (Colors.YELLOW if psi < 30 else Colors.RED)
+            print(f"   PSI   {psi_color}memory pressure avg10 = {psi:.2f}{Colors.RESET}"
+                  f"{Colors.DIM}  (0=idle, 100=stalled){Colors.RESET}")
+        print()
+
+        print(f"⚡ {Colors.BOLD}CPU{Colors.RESET}")
+        print(f"   {render_bar(cpu['percent'])} {color_for_percent(cpu['percent'])}"
+              f"{cpu['percent']:5.1f}%{Colors.RESET}  {cpu['count']} cores  "
+              f"load {cpu['load'][0]:.2f} {cpu['load'][1]:.2f} {cpu['load'][2]:.2f}")
+        print()
+
+        print(f"💾 {Colors.BOLD}STORAGE{Colors.RESET}")
+        print(f"   {render_bar(disk['percent'])} {color_for_percent(disk['percent'])}"
+              f"{disk['percent']:5.1f}%{Colors.RESET}  "
+              f"{human_size(disk['used'])} / {human_size(disk['total'])}  "
+              f"(free {human_size(disk['free'])})")
+        print()
+
+    @staticmethod
+    def sudo_noninteractive_ok():
+        if os.geteuid() == 0:
+            return True
+        if not shutil.which("sudo"):
+            return False
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "true"],
+                capture_output=True,
+                timeout=10,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def drop_caches(self, interactive=True, quiet=False):
+        """Clear page cache, dentries and inodes. Returns freed bytes or None."""
+        before = psutil.virtual_memory().available
+        try:
+            result = subprocess.run(["sync"], capture_output=True, timeout=60)
+            if result.returncode != 0 and not quiet:
+                print(f"{Colors.YELLOW}Warning: sync returned {result.returncode}{Colors.RESET}")
+
+            if os.geteuid() == 0:
+                with open("/proc/sys/vm/drop_caches", "w") as f:
+                    f.write("3\n")
+                ok = True
+            else:
+                sudo_cmd = ["sudo"] if interactive else ["sudo", "-n"]
+                result = subprocess.run(
+                    sudo_cmd + ["sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                ok = result.returncode == 0
+                if not ok and not quiet:
+                    stderr = (result.stderr or "").strip()
+                    print(f"{Colors.RED}❌ Could not clear cache (exit {result.returncode})"
+                          f"{Colors.RESET}")
+                    if stderr:
+                        print(f"{Colors.DIM}   {stderr}{Colors.RESET}")
+                    if result.returncode in (1, 126, 127) or "password" in stderr.lower():
+                        print(f"{Colors.YELLOW}   Tip: refresh your sudo ticket with: "
+                              f"sudo -v{Colors.RESET}")
+            if not ok:
+                return None
+        except subprocess.TimeoutExpired:
+            if not quiet:
+                print(f"{Colors.RED}❌ drop_caches timed out{Colors.RESET}")
+            return None
+        except OSError as e:
+            if not quiet:
+                print(f"{Colors.RED}❌ Error clearing cache: {e}{Colors.RESET}")
+            return None
+
+        after = psutil.virtual_memory().available
+        freed = max(0, after - before)
+        if not quiet:
+            if freed > 1024 * 1024:
+                print(f"{Colors.GREEN}✅ Memory cache cleared — "
+                      f"{human_size(freed)} released "
+                      f"({before / (1024**3):.2f}G → {after / (1024**3):.2f}G available){Colors.RESET}")
+            else:
+                print(f"{Colors.GREEN}✅ Memory cache cleared "
+                      f"(little to reclaim — cache was already small){Colors.RESET}")
+        return freed
+
+    def clear_memory_cache(self):
+        print(f"{Colors.YELLOW}🧹 Clearing memory cache...{Colors.RESET}")
+        self.drop_caches(interactive=True, quiet=False)
+
+    def find_large_files(self, directory="/home", min_size_mb=100, limit=20):
+        """Find large files in the specified directory"""
+        if not os.path.isdir(directory):
+            print(f"{Colors.RED}Error: directory does not exist: {directory}{Colors.RESET}")
+            return None
+
+        print(f"{Colors.YELLOW}🔍 Scanning {directory} for files larger than "
+              f"{min_size_mb}MB...{Colors.RESET}")
+
+        large_files = []
+        min_size_bytes = min_size_mb * 1024 * 1024
+        scanned = 0
+        seen_inodes = set()
+        base_dev = os.stat(directory).st_dev
+
+        try:
+            for root, dirs, files in os.walk(directory):
+                dirs[:] = [
+                    d for d in dirs
+                    if not os.path.islink(os.path.join(root, d))
+                ]
+                for name in files:
+                    file_path = os.path.join(root, name)
+                    try:
+                        st = os.lstat(file_path)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    if st.st_dev != base_dev:
+                        continue
+                    scanned += 1
+                    if scanned % 5000 == 0:
+                        print(f"\r{Colors.DIM}   scanned {scanned:,} files...{Colors.RESET}",
+                              end="", flush=True)
+                    if st.st_nlink > 1:
+                        key = (st.st_dev, st.st_ino)
+                        if key in seen_inodes:
+                            continue
+                        seen_inodes.add(key)
+                    if st.st_size > min_size_bytes:
+                        large_files.append({
+                            "path": file_path,
+                            "size": st.st_size,
+                        })
+        except OSError as e:
+            print(f"\r{Colors.RED}Error scanning directory: {e}{Colors.RESET}")
+            return large_files or []
+
+        if scanned >= 5000:
+            print(f"\r{Colors.DIM}   scanned {scanned:,} files{Colors.RESET}".ljust(60))
+
+        large_files.sort(key=lambda x: x["size"], reverse=True)
+        total = len(large_files)
+        print(f"{Colors.DIM}   {total} large file(s) found (showing {min(limit, total)}){Colors.RESET}")
+        return large_files[:limit]
+
+    def display_large_files(self, large_files):
+        """Display found large files"""
+        if large_files is None:
+            return
+        if not large_files:
+            print(f"{Colors.GREEN}✅ No large files found!{Colors.RESET}")
+            return
+
+        print(f"{Colors.BOLD}\n📁 LARGE FILES DETECTED:{Colors.RESET}")
+        print(f"{'Size':>10}  {'File Path'}")
+        print(f"{Colors.DIM}{'─' * 70}{Colors.RESET}")
+
+        for file in large_files:
+            size = file["size"]
+            size_color = Colors.RED if size >= 5 * 1024**3 else (
+                Colors.YELLOW if size >= 1024**3 else Colors.WHITE)
+            print(f"{size_color}{human_size(size):>10}{Colors.RESET}  {file['path']}")
+
+    def clean_temp_files(self, min_age_days=1, dry_run=False, assume_yes=False,
+                         verbose=True):
+        """Clean temporary files and caches, skipping in-use and recent files.
+
+        Returns a stats dict (removed/freed/failed) or None if nothing was done.
+        """
+        min_age_seconds = min_age_days * 86400
+        now = time.time()
+
+        cache_dir = os.path.expanduser("~/.cache")
+        trash_dir = os.path.expanduser("~/.local/share/Trash")
+        targets = [
+            ("/tmp", min_age_seconds),
+            ("/var/tmp", min_age_seconds),
+            (cache_dir, min_age_seconds),
+            (trash_dir, 0),
+        ]
+        targets = [(d, age) for d, age in targets if os.path.isdir(d)]
+        if not targets:
+            if verbose:
+                print(f"{Colors.YELLOW}No temporary directories found{Colors.RESET}")
+            return None
+
+        if verbose:
+            print(f"{Colors.YELLOW}🗑️  Scanning temporary files "
+                  f"(min age: {min_age_days}d for /tmp, /var/tmp and ~/.cache; "
+                  f"Trash is always emptied)...{Colors.RESET}")
+        open_paths = collect_open_files()
+
+        to_delete = []
+        skipped_open = 0
+        skipped_recent = 0
+        for base, min_age in targets:
+            base_dev = os.stat(base).st_dev
+            for root, dirs, files in os.walk(base):
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                for name in files:
+                    path = os.path.join(root, name)
+                    try:
+                        st = os.lstat(path)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+                        continue
+                    if st.st_dev != base_dev:
+                        continue
+                    if min_age and (now - st.st_mtime) < min_age:
+                        skipped_recent += 1
+                        continue
+                    if os.path.realpath(path) in open_paths:
+                        skipped_open += 1
+                        continue
+                    to_delete.append((path, st.st_size))
+
+        total_size = sum(size for _, size in to_delete)
+        if verbose:
+            print(f"{Colors.DIM}   {len(to_delete)} file(s), {human_size(total_size)} — "
+                  f"skipped {skipped_open} in use, {skipped_recent} too recent{Colors.RESET}")
+
+        if not to_delete:
+            if verbose:
+                print(f"{Colors.GREEN}✅ Nothing to clean{Colors.RESET}")
+            return {"removed": 0, "freed": 0, "failed": 0,
+                    "skipped_open": skipped_open, "skipped_recent": skipped_recent}
+
+        if dry_run:
+            if verbose:
+                print(f"{Colors.CYAN} dry-run: no files were deleted{Colors.RESET}")
+                to_delete.sort(key=lambda x: x[1], reverse=True)
+                for path, size in to_delete[:10]:
+                    print(f"   {human_size(size):>10}  {path}")
+                if len(to_delete) > 10:
+                    print(f"   {Colors.DIM}... and {len(to_delete) - 10} more{Colors.RESET}")
+            return {"removed": 0, "freed": 0, "failed": 0, "dry_run": True,
+                    "candidates": len(to_delete), "candidates_size": total_size}
+
+        if not assume_yes:
+            if not sys.stdin.isatty():
+                if verbose:
+                    print(f"{Colors.YELLOW}Non-interactive session: nothing deleted. "
+                          f"Re-run with --yes to confirm (or --dry-run to preview).{Colors.RESET}")
+                return None
+            answer = input(f"{Colors.CYAN}   Delete these files? [y/N]: {Colors.RESET}").strip().lower()
+            if answer not in ("y", "yes"):
+                if verbose:
+                    print(f"{Colors.YELLOW}Cancelled{Colors.RESET}")
+                return None
+
+        freed = 0
+        removed = 0
+        failed = 0
+        for path, size in to_delete:
+            try:
+                os.remove(path)
+                freed += size
+                removed += 1
+            except OSError:
+                failed += 1
+
+        for base, _ in targets:
+            for root, dirs, _files in os.walk(base, topdown=False):
+                if root == base:
+                    continue
+                try:
+                    os.rmdir(root)
+                except OSError:
+                    pass
+
+        if verbose:
+            msg = f"{Colors.GREEN}✅ Removed {removed} file(s), freed {human_size(freed)}"
+            if failed:
+                msg += f" ({failed} could not be removed)"
+            print(msg + Colors.RESET)
+        return {"removed": removed, "freed": freed, "failed": failed,
+                "skipped_open": skipped_open, "skipped_recent": skipped_recent}
+
+    def get_top_processes(self, limit=10, min_percent=0.5):
+        """Return top memory consumers with meaningful CPU percentages"""
+        candidates = []
+        for proc in psutil.process_iter(["pid", "name", "memory_percent"]):
+            try:
+                info = proc.info
+                mem_pct = info["memory_percent"]
+                if mem_pct is None or mem_pct < min_percent:
+                    continue
+                candidates.append((mem_pct, proc))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        top = candidates[:limit]
+
+        for _, proc in top:
+            try:
+                proc.cpu_percent(interval=None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        time.sleep(0.25)
+
+        processes = []
+        for mem_pct, proc in top:
+            try:
+                processes.append({
+                    "pid": proc.info["pid"],
+                    "name": proc.info["name"] or "?",
+                    "memory_percent": mem_pct,
+                    "cpu_percent": proc.cpu_percent(interval=None),
+                    "rss": proc.memory_info().rss,
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return processes
+
+    def display_top_processes(self):
+        """Display top memory consuming processes"""
+        processes = self.get_top_processes()
+
+        print(f"{Colors.BOLD}\n🔥 TOP MEMORY CONSUMERS:{Colors.RESET}")
+        if not processes:
+            print(f"{Colors.DIM}   no process above 0.5% RAM{Colors.RESET}")
+            return
+        print(f"{'PID':>7}  {'RSS':>9}  {'MEM %':>6}  {'CPU %':>6}  Process")
+        print(f"{Colors.DIM}{'─' * 56}{Colors.RESET}")
+        for proc in processes:
+            mem_color = color_for_percent(proc["memory_percent"] * 4)
+            print(f"{proc['pid']:>7}  {human_size(proc['rss']):>9}  "
+                  f"{mem_color}{proc['memory_percent']:5.1f}%{Colors.RESET}  "
+                  f"{proc['cpu_percent']:5.1f}%  {proc['name']}")
+
+    def _watch_frame(self, width):
+        info = self.get_system_info()
+        mem = info["memory"]
+        swap = info["swap"]
+        cpu = info["cpu"]
+        disk = info["disk"]
+
+        self.watch_history.append(mem["percent"])
+
+        bar_w = max(12, min(28, width - 54))
+        now = datetime.now().strftime("%H:%M:%S")
+        title = f" RAMDoc · LIVE MONITOR · {now} "
+        pad = width - 2 - visible_len(title)
+        lines = [f"╭─{title}{'─' * max(0, pad)}╮"]
+
+        def row(label, pct, bar, detail):
+            pct_str = f"{color_for_percent(pct)}{pct:5.1f}%{Colors.RESET}"
+            return box_line(f"{label:<5} {bar} {pct_str}  {detail}", width)
+
+        lines.append(row("RAM", mem["percent"],
+                         render_bar(mem["percent"], bar_w),
+                         f"{human_size(mem['used'])}/{human_size(mem['total'])} "
+                         f"avail {human_size(mem['available'])}"))
+        if swap["total"] > 0:
+            lines.append(row("SWAP", swap["percent"],
+                             render_bar(swap["percent"], bar_w),
+                             f"{human_size(swap['used'])}/{human_size(swap['total'])}"))
+        else:
+            lines.append(box_line(f"{'SWAP':<5} {Colors.DIM}not configured{Colors.RESET}", width))
+        lines.append(row("CPU", cpu["percent"],
+                         render_bar(cpu["percent"], bar_w),
+                         f"{cpu['count']} cores  load {cpu['load'][0]:.2f} {cpu['load'][1]:.2f}"))
+        lines.append(row("DISK", disk["percent"],
+                         render_bar(disk["percent"], bar_w),
+                         f"free {human_size(disk['free'])}"))
+        if info["psi"] is not None:
+            psi = info["psi"]
+            psi_color = Colors.GREEN if psi < 10 else (Colors.YELLOW if psi < 30 else Colors.RED)
+            lines.append(box_line(
+                f"{Colors.DIM}PSI   memory pressure avg10 = "
+                f"{psi_color}{psi:.2f}{Colors.RESET}", width))
+
+        lines.append("│" + " " * (width - 2) + "│")
+        lines.append(box_line(f"{Colors.BOLD}TOP MEMORY{Colors.RESET}", width))
+        try:
+            procs = self.get_top_processes(limit=5, min_percent=0.3)
+        except Exception:
+            procs = []
+        if procs:
+            for p in procs:
+                mem_color = color_for_percent(p["memory_percent"] * 4)
+                name = p["name"][: max(4, width - 36)]
+                lines.append(box_line(
+                    f"{p['pid']:>7}  {mem_color}{p['memory_percent']:5.1f}%{Colors.RESET}"
+                    f"  {p['cpu_percent']:5.1f}%  {name}", width))
+        else:
+            lines.append(box_line(f"{Colors.DIM}(no significant consumers){Colors.RESET}", width))
+
+        hist = sparkline(self.watch_history, max_width=max(10, width - 26))
+        lines.append("│" + " " * (width - 2) + "│")
+        lines.append(box_line(
+            f"{Colors.BOLD}RAM HISTORY{Colors.RESET} "
+            f"{Colors.DIM}last {len(self.watch_history)} samples{Colors.RESET}", width))
+        lines.append(box_line(f"  {hist}", width))
+
+        if self.watch_log:
+            lines.append("│" + " " * (width - 2) + "│")
+            lines.append(box_line(f"{Colors.BOLD}ACTIONS{Colors.RESET}", width))
+            for entry in self.watch_log:
+                lines.append(box_line(f"  {entry}", width))
+
+        lines.append(f"╰{'─' * (width - 2)}╯")
+        lines.append(f" {Colors.DIM}Ctrl+C to stop · auto-free at "
+                     f"≥{self._watch_threshold:.0f}% RAM, cooldown {self._watch_cooldown:.0f}s"
+                     f"{Colors.RESET}")
+        return "\n".join(lines), info
+
+    def watch(self, interval=2.0, threshold=85.0, cooldown=60.0, auto_free=True):
+        """Real-time dashboard with automatic memory reclaim"""
+        self._watch_threshold = threshold
+        self._watch_cooldown = cooldown
+        self.watch_history.clear()
+        self.watch_log.clear()
+
+        if auto_free and not self.sudo_noninteractive_ok():
+            print(f"{Colors.YELLOW}⚠️  Auto-free needs passwordless sudo. "
+                  f"Run 'sudo -v' in another terminal to enable it for this session "
+                  f"(or start as root).{Colors.RESET}")
+            auto_free = False
+
+        psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None, percpu=True)
+
+        last_free = 0.0
+        tty = sys.stdout.isatty()
+        if tty:
+            sys.stdout.write(Colors.ALT_SCREEN_ON + Colors.CURSOR_HIDE)
+            sys.stdout.flush()
+
+        dropped = 0
+        total_freed = 0
+        try:
+            while True:
+                width = max(60, min(110, shutil.get_terminal_size((90, 24)).columns))
+                frame, info = self._watch_frame(width)
+                if tty:
+                    sys.stdout.write(Colors.CLEAR + frame + "\n")
+                else:
+                    sys.stdout.write(frame + "\n")
+                sys.stdout.flush()
+
+                now = time.time()
+                if auto_free and info["memory"]["percent"] >= threshold and \
+                        (now - last_free) >= cooldown:
+                    stamp = datetime.now().strftime("%H:%M:%S")
+                    freed = self.drop_caches(interactive=False, quiet=True)
+                    last_free = now
+                    if freed is not None:
+                        dropped += 1
+                        total_freed += freed
+                        self.watch_log.append(
+                            f"{Colors.GREEN}{stamp} auto-free released "
+                            f"{human_size(freed)}{Colors.RESET}")
+                    else:
+                        self.watch_log.append(
+                            f"{Colors.RED}{stamp} auto-free failed "
+                            f"(sudo ticket expired?) — run 'sudo -v'{Colors.RESET}")
+
+                time.sleep(max(0.5, interval))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if tty:
+                sys.stdout.write(Colors.CURSOR_SHOW + Colors.ALT_SCREEN_OFF)
+                sys.stdout.flush()
+            print(f"\n{Colors.GREEN}👋 Monitor stopped — {dropped} auto-free event(s), "
+                  f"{human_size(total_freed)} released total{Colors.RESET}")
+
+    def run_tray(self, refresh=10.0, threshold=85.0, cooldown=60.0,
+                 auto_free=True):
+        """Run RAMDoc as a system tray icon with live RAM info, actions
+        and optional automatic cache clearing (same rules as --watch)"""
+        try:
+            from pystray import Icon, Menu, MenuItem
+        except Exception as e:
+            msg = str(e)
+            if "platform is not supported" in msg or "Namespace" in msg \
+                    or isinstance(e, ValueError):
+                print(f"{Colors.RED}Error: no tray backend available on this system{Colors.RESET}")
+                print(f"{Colors.YELLOW}Install the AppIndicator bindings:{Colors.RESET}")
+                print(f"  sudo apt install gir1.2-ayatanaappindicator3-0.1")
+                print(f"{Colors.DIM}Note: on GNOME you also need the 'AppIndicator and "
+                      f"KStatusNotifierItem Support' Shell extension{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Error: tray support requires the 'pystray' package{Colors.RESET}")
+                print(f"{Colors.YELLOW}Install with one of:{Colors.RESET}")
+                print(f"  sudo apt install python3-pystray gir1.2-ayatanaappindicator3-0.1")
+                print(f"  pip3 install pystray Pillow")
+            return 1
+        try:
+            make_tray_icon(0.0)
+        except ImportError:
+            print(f"{Colors.RED}Error: tray icons require the 'Pillow' package{Colors.RESET}")
+            print(f"{Colors.YELLOW}Install with: pip3 install Pillow "
+                  f"(or: sudo apt install python3-pil){Colors.RESET}")
+            return 1
+
+        # The tray must join the user's session bus. sudo strips
+        # DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR, GLib then tries to
+        # autolaunch a private bus via dbus-launch (not installed on
+        # modern Ubuntu) and pystray dies with g-exec-error-quark.
+        def bus_error_hint():
+            if os.geteuid() == 0:
+                return ("Running the tray with sudo breaks the system tray "
+                        "connection — run it as your user instead and use "
+                        "'sudo -v' to enable auto-free.")
+            return ("Start the tray from a terminal inside your graphical "
+                    "session (not over ssh or a stripped environment).")
+
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "")
+        if not os.environ.get("DBUS_SESSION_BUS_ADDRESS") and not (
+                runtime_dir and
+                os.path.exists(os.path.join(runtime_dir, "bus"))):
+            print(f"{Colors.RED}Error: no desktop session bus available "
+                  f"(DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR not set)"
+                  f"{Colors.RESET}")
+            print(f"{Colors.YELLOW}{bus_error_hint()}{Colors.RESET}")
+            return 1
+
+        state = {"pct": 0.0, "used": 0, "total": 0, "swap": 0.0}
+
+        def refresh_state():
+            mem = psutil.virtual_memory()
+            state.update(pct=mem.percent, used=mem.used, total=mem.total,
+                         swap=psutil.swap_memory().percent)
+
+        refresh_state()
+
+        # auto-free (watch-style) state — shared with the updater thread
+        auto = {
+            "enabled": bool(auto_free),
+            "status": "Auto-free: never ran",
+            "last_free": 0.0,
+            "count": 0,
+            "freed": 0,
+        }
+        if auto["enabled"] and not self.sudo_noninteractive_ok():
+            auto["enabled"] = False
+            auto["status"] = "Auto-free OFF — needs 'sudo -v' (or root)"
+
+        def on_clear_cache(icon, item):
+            freed = self.drop_caches(interactive=False, quiet=True)
+            if freed is None:
+                notify("RAMDoc", "Cache clear failed — run 'sudo -v' first "
+                                    "or start as root")
+            else:
+                notify("RAMDoc", f"Cache cleared — {human_size(freed)} released")
+            refresh_state()
+
+        def on_clean_temp(icon, item):
+            result = self.clean_temp_files(min_age_days=1, dry_run=False,
+                                           assume_yes=True, verbose=False)
+            if not result or not result.get("removed"):
+                notify("RAMDoc", "Nothing to clean")
+            else:
+                msg = (f"Removed {result['removed']} file(s), "
+                       f"freed {human_size(result['freed'])}")
+                if result.get("failed"):
+                    msg += f" ({result['failed']} failed)"
+                notify("RAMDoc", msg)
+
+        def on_toggle_auto_free(icon, item):
+            auto["enabled"] = not auto["enabled"]
+            if auto["enabled"]:
+                if self.sudo_noninteractive_ok():
+                    auto["status"] = "Auto-free ON"
+                else:
+                    auto["enabled"] = False
+                    auto["status"] = "Auto-free OFF — needs 'sudo -v' (or root)"
+                    notify("RAMDoc", "Auto-free needs passwordless sudo — "
+                                        "run 'sudo -v' first")
+            else:
+                auto["status"] = "Auto-free OFF"
+            icon.menu = build_menu()
+
+        def on_quit(icon, item):
+            icon.stop()
+
+        def build_menu():
+            ram_label = (f"RAM: {state['pct']:.1f}% "
+                         f"({human_size(state['used'])} / "
+                         f"{human_size(state['total'])})")
+            if state["swap"] <= 0 and psutil.swap_memory().total == 0:
+                swap_label = "SWAP: not configured"
+            else:
+                swap_label = f"SWAP: {state['swap']:.1f}%"
+            auto_label = (f"Auto-free (≥{threshold:.0f}%, "
+                          f"cooldown {cooldown:.0f}s)")
+            return Menu(
+                MenuItem(ram_label, None, enabled=False),
+                MenuItem(swap_label, None, enabled=False),
+                Menu.SEPARATOR,
+                MenuItem("Clear memory cache", on_clear_cache),
+                MenuItem("Clean temp files (≥1 day old)", on_clean_temp),
+                Menu.SEPARATOR,
+                MenuItem(auto_label, on_toggle_auto_free,
+                         checked=lambda item: auto["enabled"]),
+                MenuItem(auto["status"], None, enabled=False),
+                Menu.SEPARATOR,
+                MenuItem("Quit", on_quit, default=True),
+            )
+
+        image = make_tray_icon(state["pct"])
+        try:
+            icon = Icon("ramdoc", image,
+                        f"RAMDoc — RAM {state['pct']:.1f}%",
+                        menu=build_menu())
+        except Exception as e:
+            print(f"{Colors.RED}Error: tray backend failed to start: {e}"
+                  f"{Colors.RESET}")
+            print(f"{Colors.YELLOW}{bus_error_hint()}{Colors.RESET}")
+            return 1
+
+        stop = threading.Event()
+
+        def auto_free_tick():
+            now = time.time()
+            if not auto["enabled"] or state["pct"] < threshold:
+                return
+            if (now - auto["last_free"]) < cooldown:
+                return
+            auto["last_free"] = now
+            freed = self.drop_caches(interactive=False, quiet=True)
+            stamp = datetime.now().strftime("%H:%M:%S")
+            if freed is not None:
+                auto["count"] += 1
+                auto["freed"] += freed
+                auto["status"] = (f"Last free {stamp}: "
+                                  f"{human_size(freed)} released")
+                notify("RAMDoc — auto-free",
+                       f"RAM {state['pct']:.0f}% — "
+                       f"{human_size(freed)} released")
+            else:
+                auto["enabled"] = False
+                auto["status"] = (f"Auto-free OFF — drop failed {stamp} "
+                                  f"(sudo ticket expired?)")
+                notify("RAMDoc — auto-free",
+                       "Failed — run 'sudo -v' to re-enable")
+
+        def updater():
+            while not stop.wait(refresh):
+                try:
+                    refresh_state()
+                    auto_free_tick()
+                    icon.icon = make_tray_icon(state["pct"])
+                    icon.title = f"RAMDoc — RAM {state['pct']:.1f}%"
+                    # NOTE: pystray + libayatana crash on DBus
+                    # (GLib-GIO-CRITICAL on emit_signal) when a MenuItem
+                    # uses a callable text and update_menu() is called —
+                    # recreate the menu with static labels instead.
+                    icon.menu = build_menu()
+                except Exception:
+                    continue
+
+        threading.Thread(target=updater, daemon=True).start()
+        mode = "auto-free ON" if auto["enabled"] else "auto-free off"
+        print(f"{Colors.CYAN}📡 Tray icon running (RAM {state['pct']:.1f}%) — "
+              f"refresh every {refresh:.0f}s, {mode} "
+              f"(≥{threshold:.0f}%, cooldown {cooldown:.0f}s){Colors.RESET}",
+              flush=True)
+        try:
+            icon.run()
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:
+            print(f"{Colors.RED}Error: tray backend failed: {e}{Colors.RESET}")
+            print(f"{Colors.YELLOW}{bus_error_hint()}{Colors.RESET}")
+            return 1
+        finally:
+            stop.set()
+            try:
+                icon.stop()
+            except Exception:
+                pass
+        print(f"\n{Colors.GREEN}👋 Tray icon stopped{Colors.RESET}")
+        return 0
+
+    def interactive_menu(self):
+        """Display interactive menu"""
+        while True:
+            print(f"\n{Colors.BOLD}═══════════════════ MENU ═══════════════════{Colors.RESET}")
+            print(f"{Colors.GREEN}1.{Colors.RESET} Show System Status")
+            print(f"{Colors.GREEN}2.{Colors.RESET} Clear Memory Cache (requires sudo)")
+            print(f"{Colors.GREEN}3.{Colors.RESET} Find Large Files")
+            print(f"{Colors.GREEN}4.{Colors.RESET} Clean Temporary Files")
+            print(f"{Colors.GREEN}5.{Colors.RESET} Show Top Memory Consumers")
+            print(f"{Colors.GREEN}6.{Colors.RESET} Live Monitor (real-time + auto-free)")
+            print(f"{Colors.GREEN}7.{Colors.RESET} Full System Cleanup")
+            print(f"{Colors.GREEN}8.{Colors.RESET} System Tray Icon (background)")
+            print(f"{Colors.RED}0.{Colors.RESET} Exit")
+
+            try:
+                choice = input(f"\n{Colors.CYAN}Select option: {Colors.RESET}").strip()
+            except EOFError:
+                print(f"\n{Colors.GREEN}👋 Goodbye!{Colors.RESET}")
+                break
+
+            if choice == "1":
+                self.display_system_status()
+            elif choice == "2":
+                self.clear_memory_cache()
+            elif choice == "3":
+                directory = input("Directory to scan (default: /home): ").strip() or "/home"
+                size_mb = input("Minimum file size in MB (default: 100): ").strip() or "100"
+                try:
+                    size_mb = int(size_mb)
+                    if size_mb <= 0:
+                        raise ValueError
+                    large_files = self.find_large_files(directory, size_mb)
+                    if large_files is not None:
+                        self.display_large_files(large_files)
+                except ValueError:
+                    print(f"{Colors.RED}Invalid size value!{Colors.RESET}")
+            elif choice == "4":
+                self.clean_temp_files(min_age_days=1, dry_run=False, assume_yes=False)
+            elif choice == "5":
+                self.display_top_processes()
+            elif choice == "6":
+                print(f"{Colors.CYAN}Starting live monitor (Ctrl+C to stop)...{Colors.RESET}")
+                time.sleep(0.5)
+                self.watch(interval=2.0, threshold=85.0, cooldown=60.0, auto_free=True)
+            elif choice == "7":
+                print(f"{Colors.YELLOW}🚀 Performing full system cleanup...{Colors.RESET}")
+                self.clean_temp_files(min_age_days=1, dry_run=False, assume_yes=True)
+                self.clear_memory_cache()
+                print(f"{Colors.GREEN}✅ Full cleanup completed!{Colors.RESET}")
+            elif choice == "8":
+                self.run_tray()
+            elif choice == "0":
+                print(f"{Colors.GREEN}👋 Goodbye!{Colors.RESET}")
+                break
+            else:
+                print(f"{Colors.RED}Invalid option!{Colors.RESET}")
+
+    def run(self, args):
+        """Main run method"""
+        action_flags = [args.status, args.clean, args.large_files,
+                        args.temp_clean, args.processes, args.tray,
+                        args.watch is not None]
+        if not any(action_flags):
+            self.print_banner()
+            self.display_system_status()
+            self.interactive_menu()
+            return 0
+
+        if args.status:
+            self.display_system_status()
+        elif args.clean:
+            self.clear_memory_cache()
+        elif args.large_files:
+            large_files = self.find_large_files(args.directory, args.size, args.limit)
+            if large_files is None:
+                return 1
+            self.display_large_files(large_files)
+        elif args.temp_clean:
+            self.clean_temp_files(
+                min_age_days=args.min_age,
+                dry_run=args.dry_run,
+                assume_yes=args.yes,
+            )
+        elif args.processes:
+            self.display_top_processes()
+        elif args.tray:
+            return self.run_tray(refresh=args.tray_refresh,
+                                 threshold=args.threshold,
+                                 cooldown=args.cooldown,
+                                 auto_free=not args.no_auto_free)
+        elif args.watch is not None:
+            interval = args.watch if args.watch > 0 else 2.0
+            self.watch(
+                interval=interval,
+                threshold=args.threshold,
+                cooldown=args.cooldown,
+                auto_free=not args.no_auto_free,
+            )
+        return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="RAMDoc - Monitor de desempenho e otimizador de memoria",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  ./RAMDoc                          # Interactive mode
+  ./RAMDoc --status                 # Show system status only
+  ./RAMDoc --clean                  # Clear memory cache (drop_caches)
+  ./RAMDoc --large-files            # Find large files
+  ./RAMDoc --large-files --directory /data --size 500 --limit 10
+  ./RAMDoc --temp-clean --dry-run   # Preview temp cleanup
+  ./RAMDoc --temp-clean --yes       # Clean temp files without asking
+  ./RAMDoc --processes              # Show top memory consumers
+  ./RAMDoc --watch                  # Live monitor + auto-free at 85% RAM
+  ./RAMDoc --watch 5 --threshold 90 # Refresh every 5s, free at 90%
+  ./RAMDoc --tray                   # System tray icon (needs pystray)
+  ./RAMDoc --tray --threshold 90    # Tray + auto-free at 90% RAM
+        """,
+    )
+
+    parser.add_argument("--status", action="store_true", help="Show system status")
+    parser.add_argument("--clean", action="store_true", help="Clear memory cache")
+    parser.add_argument("--large-files", action="store_true", help="Find large files")
+    parser.add_argument("--temp-clean", action="store_true", help="Clean temporary files")
+    parser.add_argument("--processes", action="store_true", help="Show top processes")
+    parser.add_argument(
+        "--watch", nargs="?", const=2.0, type=positive_float, default=None, metavar="SECONDS",
+        help="Live monitor with auto-free (default refresh: 2s)",
+    )
+    parser.add_argument("--directory", default="/home", help="Directory to scan for large files")
+    parser.add_argument("--size", type=positive_int, default=100, help="Minimum file size in MB")
+    parser.add_argument("--limit", type=positive_int, default=20,
+                        help="Limit number of large files shown")
+    parser.add_argument("--min-age", type=positive_int, default=1,
+                        help="Minimum age in days for /tmp and /var/tmp files (default: 1)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --temp-clean: only show what would be deleted")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="With --temp-clean: skip confirmation")
+    parser.add_argument("--threshold", type=positive_float, default=85.0,
+                        help="With --watch/--tray: auto-free RAM usage threshold in %% (default: 85)")
+    parser.add_argument("--cooldown", type=positive_float, default=60.0,
+                        help="With --watch/--tray: minimum seconds between auto-free runs (default: 60)")
+    parser.add_argument("--no-auto-free", action="store_true",
+                        help="With --watch/--tray: monitor only, never clear cache")
+    parser.add_argument("--tray", action="store_true",
+                        help="Run as a system tray icon (needs pystray + Pillow)")
+    parser.add_argument("--tray-refresh", type=positive_float, default=10.0,
+                        help="With --tray: icon refresh interval in seconds (default: 10)")
+
+    args = parser.parse_args()
+
+    app = RamDoc()
+    try:
+        return app.run(args) or 0
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Operation cancelled by user{Colors.RESET}")
+        return 130
+    except psutil.AccessDenied as e:
+        print(f"{Colors.RED}Permission denied: {e}{Colors.RESET}")
+        return 1
+    except OSError as e:
+        print(f"{Colors.RED}System error: {e}{Colors.RESET}")
+        return 1
+    except Exception as e:
+        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
